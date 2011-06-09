@@ -68,7 +68,10 @@
              riak_kv_wm_raw,
              riak_kv_wm_stats,
              riak_kv_encoding_migrate,
-             riak_object
+             riak_object,
+             riaktor,
+             riaktor_utils,
+             riaktor_metrics
             ]},
   {applications, [
                   kernel,
