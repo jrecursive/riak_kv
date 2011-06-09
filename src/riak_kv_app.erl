@@ -79,6 +79,9 @@ start(_Type, _StartArgs) ->
     %% Register our cluster_info app callback modules, with catch if
     %% the app is missing or packaging is broken.
     catch cluster_info:register_app(riak_kv_cinfo),
+    
+    %% Start the Riaktor subsystems.
+    riaktor:init(),
 
     %% Spin up supervisor
     case riak_kv_sup:start_link() of

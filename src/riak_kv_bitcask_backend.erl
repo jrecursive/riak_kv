@@ -52,7 +52,8 @@
 -define(MERGE_CHECK_INTERVAL, timer:minutes(3)).
 
 start(Partition, Config) ->
-
+    StartTime = erlang:now(),
+    
     %% Get the data root directory
     DataDir =
         case proplists:get_value(data_root, Config) of
@@ -80,45 +81,80 @@ start(Partition, Config) ->
     end,
 
     BitcaskOpts = [{read_write, true}|Config],
-    case bitcask:open(BitcaskRoot, BitcaskOpts) of
+    RV = case bitcask:open(BitcaskRoot, BitcaskOpts) of
         Ref when is_reference(Ref) ->
             schedule_merge(Ref),
             maybe_schedule_sync(Ref),
             {ok, {Ref, BitcaskRoot}};
         {error, Reason2} ->
             {error, Reason2}
-    end.
+    end,
+    riaktor_metrics:notify(?MODULE, start, histogram,
+        timer:now_diff(erlang:now(), StartTime)/1000),
+    riaktor_metrics:notify(?MODULE, start, counter, 1),
+    riaktor_metrics:notify(?MODULE, events, history, io_lib:format("start(~p, ~p)", 
+        [Partition, Config])),
+    RV.
 
 
 stop({Ref, _}) ->
-    bitcask:close(Ref).
+    StartTime = erlang:now(),
+    RV = bitcask:close(Ref),
+    riaktor_metrics:notify(?MODULE, stop, histogram,
+        timer:now_diff(erlang:now(), StartTime)/1000),
+    riaktor_metrics:notify(?MODULE, stop, counter, 1),
+    riaktor_metrics:notify(?MODULE, events, history, io_lib:format("stop(~p, _)", 
+        [Ref])),
+    RV.
 
 
 get({Ref, _}, BKey) ->
+    StartTime = erlang:now(),
     Key = term_to_binary(BKey),
-    case bitcask:get(Ref, Key) of
+    RV = case bitcask:get(Ref, Key) of
         {ok, Value} ->
             {ok, Value};
         not_found  ->
             {error, notfound};
         {error, Reason} ->
             {error, Reason}
-    end.
+    end,
+    riaktor_metrics:notify(?MODULE, get, histogram,
+        timer:now_diff(erlang:now(), StartTime)/1000),
+    riaktor_metrics:notify(?MODULE, get, counter, 1),
+    RV.
 
 put({Ref, _}, BKey, Val) ->
+    StartTime = erlang:now(),
     Key = term_to_binary(BKey),
-    ok =  bitcask:put(Ref, Key, Val).
+    RV =  bitcask:put(Ref, Key, Val),
+    riaktor_metrics:notify(?MODULE, put, histogram,
+        timer:now_diff(erlang:now(), StartTime)/1000),
+    riaktor_metrics:notify(?MODULE, put, counter, 1),
+    ok = RV.
 
 delete({Ref, _}, BKey) ->
-    ok = bitcask:delete(Ref, term_to_binary(BKey)).
+    StartTime = erlang:now(),
+    RV = bitcask:delete(Ref, term_to_binary(BKey)),
+    riaktor_metrics:notify(?MODULE, del, histogram,
+        timer:now_diff(erlang:now(), StartTime)/1000),
+    riaktor_metrics:notify(?MODULE, del, counter, 1),
+    ok = RV.
 
 list({Ref, _}) ->
-    case bitcask:list_keys(Ref) of
+    StartTime = erlang:now(),
+    RV = case bitcask:list_keys(Ref) of
         KeyList when is_list(KeyList) ->
             [binary_to_term(K) || K <- KeyList];
         Other ->
             Other
-    end.
+    end,
+    riaktor_metrics:notify(?MODULE, list, histogram,
+        timer:now_diff(erlang:now(), StartTime)/1000),
+    riaktor_metrics:notify(?MODULE, list, counter, 1),
+    riaktor_metrics:notify(?MODULE, events, history, io_lib:format("list(~p, _)", 
+        [Ref])),
+    RV.
 
 list_bucket({Ref, _}, {filter, Bucket, Fun}) ->
     bitcask:fold_keys(Ref,
@@ -161,9 +197,16 @@ fold({Ref, _}, Fun0, Acc0) ->
                  Acc0).
 
 fold_keys({Ref, _}, Fun, Acc) ->
+    StartTime = erlang:now(),
     F = fun(#bitcask_entry{key=K}, Acc1) ->
                 Fun(binary_to_term(K), Acc1) end,
-    bitcask:fold_keys(Ref, F, Acc).
+    RV = bitcask:fold_keys(Ref, F, Acc),
+    riaktor_metrics:notify(?MODULE, fold_keys, histogram,
+        timer:now_diff(erlang:now(), StartTime)/1000),
+    riaktor_metrics:notify(?MODULE, fold_keys, counter, 1),
+    riaktor_metrics:notify(?MODULE, events, history, io_lib:format("fold_keys({~p, _}, ~p, length(Acc) = ~p)", 
+        [Ref, Fun, length(Acc)])),
+    RV.
 
 fold_bucket_keys(ModState, _Bucket, Fun, Acc) ->
     fold_keys(ModState, fun(Key2, Acc2) -> Fun(Key2, dummy_val, Acc2) end, Acc).
@@ -175,28 +218,52 @@ drop({Ref, BitcaskRoot}) ->
     {ok, FNs} = file:list_dir(BitcaskRoot),
     [file:delete(filename:join(BitcaskRoot, FN)) || FN <- FNs],
     file:del_dir(BitcaskRoot),
+    riaktor_metrics:notify(?MODULE, drop, counter, 1),
+    riaktor_metrics:notify(?MODULE, events, history, io_lib:format("drop({~p, ~p})", 
+        [Ref, BitcaskRoot])),
     ok.
 
 is_empty({Ref, _}) ->
     %% Determining if a bitcask is empty requires us to find at least
     %% one value that is NOT a tombstone. Accomplish this by doing a fold_keys
     %% that forcibly bails on the very first key encountered.
+    StartTime = erlang:now(),
     F = fun(_K, _Acc0) ->
                 throw(found_one_value)
         end,
-    (catch bitcask:fold_keys(Ref, F, undefined)) /= found_one_value.
+    RV = (catch bitcask:fold_keys(Ref, F, undefined)) /= found_one_value,
+    riaktor_metrics:notify(?MODULE, is_empty, histogram,
+        timer:now_diff(erlang:now(), StartTime)/1000),
+    riaktor_metrics:notify(?MODULE, is_empty, counter, 1),
+    riaktor_metrics:notify(?MODULE, events, history, io_lib:format("is_empty({~p, _})", 
+        [Ref])),
+    RV.
 
 callback({Ref, _}, Ref, {sync, SyncInterval}) when is_reference(Ref) ->
+    StartTime = erlang:now(),
     bitcask:sync(Ref),
-    schedule_sync(Ref, SyncInterval);
+    RV = schedule_sync(Ref, SyncInterval),
+    riaktor_metrics:notify(?MODULE, sync, histogram,
+        timer:now_diff(erlang:now(), StartTime)/1000),
+    riaktor_metrics:notify(?MODULE, sync, counter, 1),
+    riaktor_metrics:notify(?MODULE, events, history, io_lib:format("callback[sync]({~p, _}), {sync, SyncInterval = ~p}", 
+        [Ref, SyncInterval])),
+    RV;
 callback({Ref, BitcaskRoot}, Ref, merge_check) when is_reference(Ref) ->
+    StartTime = erlang:now(),
     case bitcask:needs_merge(Ref) of
         {true, Files} ->
             bitcask_merge_worker:merge(BitcaskRoot, [], Files);
         false ->
             ok
     end,
-    schedule_merge(Ref);
+    RV = schedule_merge(Ref),
+    riaktor_metrics:notify(?MODULE, merge_check, histogram,
+        timer:now_diff(erlang:now(), StartTime)/1000),
+    riaktor_metrics:notify(?MODULE, merge_check, counter, 1),
+    riaktor_metrics:notify(?MODULE, events, history, io_lib:format("callback[merge_check]({~p, ~p})", 
+        [Ref, BitcaskRoot])),
+    RV;
 %% Ignore callbacks for other backends so multi backend works
 callback(_State, _Ref, _Msg) ->
     ok.

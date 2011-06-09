@@ -157,10 +157,14 @@ get_vclocks(Preflist, BKeyList) ->
 %% VNode callbacks
 
 init([Index]) ->
+    InitTimerStart = erlang:now(),
     Mod = app_helper:get_env(riak_kv, storage_backend),
     Configuration = app_helper:get_env(riak_kv),
     {ok, ModState} = Mod:start(Index, Configuration),
-
+    riaktor_metrics:notify(?MODULE, init, histogram,
+        timer:now_diff(erlang:now(), InitTimerStart)/1000),
+    riaktor_metrics:notify(?MODULE, init, counter, 1),
+    riaktor_metrics:notify(?MODULE, events, history, io_lib:format("init(~p)", [Index])),
     {ok, #state{idx=Index, mod=Mod, modstate=ModState, mrjobs=dict:new()}}.
 
 handle_command(?KV_PUT_REQ{bkey=BKey,
@@ -298,6 +302,7 @@ handle_exit(_Pid, _Reason, State) ->
 %% @private
 % upon receipt of a client-initiated put
 do_put(Sender, {Bucket,_Key}=BKey, RObj, ReqID, StartTime, Options, State) ->
+    TimerStartTime = erlang:now(),
     case proplists:get_value(bucket_props, Options) of
         undefined ->
             {ok,Ring} = riak_core_ring_manager:get_my_ring(),
@@ -321,6 +326,9 @@ do_put(Sender, {Bucket,_Key}=BKey, RObj, ReqID, StartTime, Options, State) ->
                        prunetime=PruneTime},
     Reply = perform_put(prepare_put(State, PutArgs), State, PutArgs),
     riak_core_vnode:reply(Sender, Reply),
+    riaktor_metrics:notify(?MODULE, put, histogram,
+        timer:now_diff(erlang:now(), TimerStartTime)/1000),
+    riaktor_metrics:notify(?MODULE, put, counter, 1),
     riak_kv_stat:update(vnode_put).
 
 prepare_put(#state{}, #putargs{lww=true, robj=RObj}) ->
@@ -412,11 +420,16 @@ syntactic_put_merge(Mod, ModState, BKey, Obj1, ReqId, StartTime) ->
 %% @private
 do_get(_Sender, BKey, ReqID,
        State=#state{idx=Idx,mod=Mod,modstate=ModState}) ->
+    StartTime = erlang:now(),
     Retval = do_get_term(BKey, Mod, ModState),
     riak_kv_stat:update(vnode_get),
+    riaktor_metrics:notify(?MODULE, get, histogram,
+        timer:now_diff(erlang:now(), StartTime)/1000),
+    riaktor_metrics:notify(?MODULE, get, counter, 1),
     {reply, {r, Retval, Idx, ReqID}, State}.
 
 do_mget({fsm, Sender}, BKeys, ReqId, State=#state{idx=Idx, mod=Mod, modstate=ModState}) ->
+    StartTime = erlang:now(),
     F = fun(BKey) ->
                 R = do_get_term(BKey, Mod, ModState),
                 case R of
@@ -427,6 +440,9 @@ do_mget({fsm, Sender}, BKeys, ReqId, State=#state{idx=Idx, mod=Mod, modstate=Mod
                 end,
                 riak_kv_stat:update(vnode_get) end,
     [F(BKey) || BKey <- BKeys],
+    riaktor_metrics:notify(?MODULE, mget, histogram,
+        timer:now_diff(erlang:now(), StartTime)/1000),
+    riaktor_metrics:notify(?MODULE, mget, counter, 1),
     {noreply, State}.
 
 %% @private
@@ -444,11 +460,18 @@ do_get_binary(BKey, Mod, ModState) ->
 
 %% @private
 do_list_bucket(ReqID,Bucket,Mod,ModState,Idx,State) ->
+    StartTime = erlang:now(),
     RetVal = Mod:list_bucket(ModState,Bucket),
+    riaktor_metrics:notify(?MODULE, list_bucket, histogram,
+        timer:now_diff(erlang:now(), StartTime)/1000),
+    riaktor_metrics:notify(?MODULE, list_bucket, counter, 1),
+    riaktor_metrics:notify(?MODULE, events, history, io_lib:format("do_list_bucket(~p, ~p, ~p, ~p, ~p, ~p)", 
+        [ReqID,Bucket,Mod,ModState,Idx,State])),
     {reply, {kl, RetVal, Idx, ReqID}, State}.
 
 %% @private
 do_list_keys(Caller,ReqId,Bucket,Idx,Mod,ModState) ->
+    StartTime = erlang:now(),
     F = fun({_, _} = BKey, _Val, Acc) ->
                 process_keys(Caller, ReqId, Idx, Bucket, BKey, Acc);
            (Key, _Val, Acc) when is_binary(Key) ->
@@ -483,16 +506,26 @@ do_list_keys(Caller,ReqId,Bucket,Idx,Mod,ModState) ->
         Remainder when is_list(Remainder) ->
             Caller ! {ReqId, {kl, Idx, Remainder}}
     end,
+    riaktor_metrics:notify(?MODULE, list_keys, histogram,
+        timer:now_diff(erlang:now(), StartTime)/1000),
+    riaktor_metrics:notify(?MODULE, list_keys, counter, 1),
+    riaktor_metrics:notify(?MODULE, events, history, io_lib:format("do_list_keys(~p, ~p, ~p, ~p, ~p, ~p)", 
+        [Caller,ReqId,Bucket,Idx,Mod,ModState])),
     Caller ! {ReqId, Idx, done}.
 
 %% @private
 do_delete(BKey, Mod, ModState) ->
-    case Mod:delete(ModState, BKey) of
+    StartTime = erlang:now(),
+    RV = case Mod:delete(ModState, BKey) of
         ok ->
             del;
         {error, _Reason} ->
             fail
-    end.
+    end,
+    riaktor_metrics:notify(?MODULE, del, histogram,
+        timer:now_diff(erlang:now(), StartTime)/1000),
+    riaktor_metrics:notify(?MODULE, del, counter, 1),
+    RV.
 
 %% @private
 process_keys(Caller, ReqId, Idx, '_', {Bucket, _K}, Acc) ->
@@ -523,7 +556,14 @@ buffer_key_result(Caller, ReqId, Idx, Acc) ->
 
 %% @private
 do_fold(Fun, Acc0, _State=#state{mod=Mod, modstate=ModState}) ->
-    Mod:fold(ModState, Fun, Acc0).
+    StartTime = erlang:now(),
+    RV = Mod:fold(ModState, Fun, Acc0),
+    riaktor_metrics:notify(?MODULE, fold, histogram,
+        timer:now_diff(erlang:now(), StartTime)/1000),
+    riaktor_metrics:notify(?MODULE, fold, counter, 1),
+    riaktor_metrics:notify(?MODULE, events, history, io_lib:format("do_fold(~p, length(Acc0) = ~p, ~p)", 
+        [Fun, length(Acc0), _State])),
+    RV.
 
 %% @private
 do_get_vclocks(KeyList,_State=#state{mod=Mod,modstate=ModState}) ->
